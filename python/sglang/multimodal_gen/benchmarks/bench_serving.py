@@ -19,9 +19,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -61,6 +62,67 @@ def _compute_scale_factor(req: RequestFuncInput, args) -> Optional[float]:
 
     area_units = max((float(width) * float(height)) / float(PATCH_AREA), 1.0)
     return area_units * float(frame_scale) * float(step_scale)
+
+
+def _parse_size_set(size_set: Optional[str]) -> Optional[List[Tuple[int, int]]]:
+    if size_set is None:
+        return None
+    raw = size_set.strip()
+    if not raw:
+        return None
+
+    raw = re.sub(r"[\{\}\[\]\(\)]", " ", raw)
+    parts = [p.strip().strip(",") for p in re.split(r"[\s,]+", raw) if p]
+
+    sizes: List[Tuple[int, int]] = []
+    for p in parts:
+        if not p:
+            continue
+
+        if "x" in p.lower():
+            wh = re.split(r"[xX]", p)
+            if len(wh) != 2:
+                raise ValueError(
+                    f"Invalid --size-set entry '{p}'. Expected 'W' or 'WxH' like '512x768'."
+                )
+            try:
+                w = int(wh[0])
+                h = int(wh[1])
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid --size-set entry '{p}'. Expected 'W' or 'WxH' like '512x768'."
+                ) from e
+        else:
+            try:
+                side = int(p)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid --size-set entry '{p}'. Expected 'W' or 'WxH' like '512x768'."
+                ) from e
+            w = side
+            h = side
+
+        if w <= 0 or h <= 0:
+            raise ValueError(
+                f"Invalid --size-set entry '{p}'. Width/height must be positive."
+            )
+
+        sizes.append((w, h))
+
+    return sizes or None
+
+
+def _parse_weights(weights: Optional[str], n: int) -> Optional[np.ndarray]:
+    if weights is None:
+        return None
+    parts = [p for p in re.split(r"[\s,]+", weights.strip()) if p]
+    if len(parts) != n:
+        raise ValueError(f"--size-weights must have same length as --size-set ({n}).")
+    w = np.array([float(p) for p in parts], dtype=np.float64)
+    if np.any(w < 0) or np.all(w == 0):
+        raise ValueError("--size-weights must be non-negative and not all zero.")
+    w = w / w.sum()
+    return w
 
 
 def _compute_expected_latency_ms_from_base(
@@ -518,6 +580,52 @@ async def benchmark(args):
 
     setattr(args, "task_name", task_name)
 
+    args.size_set_list = _parse_size_set(getattr(args, "size_set", None))
+    if args.size_set_list:
+        args.size_weights = _parse_weights(
+            getattr(args, "size_weights", None), len(args.size_set_list)
+        )
+    else:
+        if getattr(args, "size_weights", None) is not None:
+            raise ValueError("--size-weights requires --size-set")
+        args.size_weights = None
+
+    if args.size_weights is not None and args.size_policy != "random":
+        raise ValueError("--size-weights only supported with --size-policy random.")
+
+    if args.size_policy != "fixed" and not args.size_set_list:
+        raise ValueError(
+            "--size-policy requires --size-set (e.g. --size-set '512,640,768' or '512x768,768x1024')"
+        )
+
+    if args.size_policy != "fixed" and (
+        args.width is not None or args.height is not None
+    ):
+        raise ValueError(
+            "--width/--height are incompatible with --size-policy != fixed. Use --size-set only."
+        )
+
+    if args.size_set_list and args.size_policy == "fixed":
+        if args.width is None and args.height is None:
+            w0, h0 = args.size_set_list[0]
+            args.width = int(w0)
+            args.height = int(h0)
+
+    if args.size_set_list and args.size_policy == "random":
+        if args.size_seed is None:
+            raise ValueError(
+                "--size-policy random requires --size-seed for determinism."
+            )
+        args._size_rng = np.random.default_rng(args.size_seed)
+    else:
+        args._size_rng = None
+
+    if args.square:
+        if args.width is None and args.height is not None:
+            args.width = int(args.height)
+        if args.height is None and args.width is not None:
+            args.height = int(args.width)
+
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "random":
@@ -600,6 +708,15 @@ async def benchmark(args):
     print_value_formatted("Task:", task_name)
     print_value_formatted("Model:", args.model)
     print_value_formatted("Dataset:", args.dataset)
+    print_value_formatted("Size policy:", args.size_policy)
+    print_value_formatted("Size set:", str(getattr(args, "size_set_list", None)))
+    if getattr(args, "size_weights", None) is not None:
+        print_value_formatted(
+            "Size weights:",
+            np.array2string(getattr(args, "size_weights"), precision=3),
+        )
+    if args.size_seed is not None:
+        print_value_formatted("Size seed:", str(args.size_seed))
 
     # Section 2: Execution & Traffic
     print_divider(50)
@@ -719,6 +836,39 @@ if __name__ == "__main__":
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
+    parser.add_argument(
+        "--size-set",
+        type=str,
+        default=None,
+        help=(
+            "Comma/space-separated sizes. Each entry can be 'W' (square) or 'WxH' (non-square), "
+            "e.g. '512,640,768' or '{512x512 512x768 768x1024}'. Used when --size-policy is not fixed."
+        ),
+    )
+    parser.add_argument(
+        "--size-policy",
+        type=str,
+        choices=["fixed", "round_robin", "random"],
+        default="fixed",
+        help="Size selection policy. fixed uses --width/--height. round_robin/random pick from --size-set.",
+    )
+    parser.add_argument(
+        "--size-weights",
+        type=str,
+        default=None,
+        help='Optional weights aligned to --size-set, e.g. "0.1,0.2,0.7" (same length). Only for random policy.',
+    )
+    parser.add_argument(
+        "--size-seed",
+        type=int,
+        default=None,
+        help="Seed for deterministic --size-policy random (required when --size-policy=random).",
+    )
+    parser.add_argument(
+        "--square",
+        action="store_true",
+        help="Force height=width for each request (applies after size selection).",
+    )
     parser.add_argument(
         "--num-frames", type=int, default=None, help="Number of frames (for video)."
     )

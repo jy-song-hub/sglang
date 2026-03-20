@@ -6,14 +6,52 @@ import subprocess
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import requests
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _resolve_request_size(
+    args,
+    idx: int,
+    rng: Optional[np.random.Generator],
+) -> Tuple[Optional[int], Optional[int]]:
+    sizes = getattr(args, "size_set_list", None)
+    policy = getattr(args, "size_policy", "fixed")
+
+    if not sizes or policy == "fixed":
+        width = getattr(args, "width", None)
+        height = getattr(args, "height", None)
+    elif policy == "round_robin":
+        w, h = sizes[idx % len(sizes)]
+        width = int(w)
+        height = int(h)
+    elif policy == "random":
+        if rng is None:
+            raise ValueError(
+                "Internal error: rng is None for random size policy. Did you set args._size_rng?"
+            )
+        weights = getattr(args, "size_weights", None)
+        choice_idx = int(rng.choice(len(sizes), p=weights))
+        w, h = sizes[choice_idx]
+        width = int(w)
+        height = int(h)
+    else:
+        raise ValueError(f"Unknown size policy: {policy}")
+
+    if getattr(args, "square", False):
+        if width is None and height is None:
+            return (None, None)
+        side = int(width if width is not None else height)
+        return (side, side)
+
+    return (width, height)
 
 
 @dataclass
@@ -53,6 +91,7 @@ class BaseDataset(ABC):
         self.api_url = api_url
         self.model = model
         self.items: List[Dict[str, Any]] = []
+        self._size_rng = getattr(args, "_size_rng", None)
 
     @abstractmethod
     def __len__(self) -> int:
@@ -269,12 +308,13 @@ class VBenchDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
         item = self.items[idx]
+        width, height = _resolve_request_size(self.args, idx, self._size_rng)
         return RequestFuncInput(
             prompt=item.get("prompt", ""),
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
+            width=width,
+            height=height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
             image_paths=[item["image_path"]] if "image_path" in item else None,
@@ -290,12 +330,13 @@ class RandomDataset(BaseDataset):
         return self.num_prompts
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
+        width, height = _resolve_request_size(self.args, idx, self._size_rng)
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
+            width=width,
+            height=height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
         )
