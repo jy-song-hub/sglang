@@ -157,6 +157,16 @@ class Req:
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
 
+    # diffusion hw bucketing (v1)
+    bucket_id: int = -1
+    padding_ratio: float = 0.0
+    # Backward-compatible alias: bucket_hit is True only when padding was applied
+    # (i.e. the request was padded into a reusable bucket), not for any bucket assignment.
+    bucket_hit: bool = False
+    bucket_applied: bool = False
+    bucket_padded: bool = False
+    bucket_exact_match: bool = False
+
     def __init__(self, **kwargs):
         # Initialize dataclass fields
         for name, field in self.__class__.__dataclass_fields__.items():

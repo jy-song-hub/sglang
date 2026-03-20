@@ -12,6 +12,7 @@ import time
 import weakref
 from collections.abc import Iterable
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -24,6 +25,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, S
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
+
+try:
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+        QwenImagePipelineConfig as _QwenImagePipelineConfig,
+    )
+except ImportError:
+    _QwenImagePipelineConfig = None
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -69,11 +77,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.utils.bucketing_masks import (
+    build_key_padding_mask_bcthw,
+    should_use_masked_bucketing,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.utils.shape_bucketing import (
+    apply_shape_bucketing,
+    get_orig_thw,
+    remove_shape_bucketing,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -82,6 +100,33 @@ from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
+
+
+def _is_qwen_image_pipeline(pipeline_cfg: Any) -> bool:
+    cfg_t = _QwenImagePipelineConfig
+    return cfg_t is not None and isinstance(pipeline_cfg, cfg_t)
+
+
+def _infer_orig_thw_from_latents(
+    latents: torch.Tensor,
+    unpacked_shape: Any,
+) -> tuple[int, int, int]:
+    orig_thw = (int(latents.shape[2]), int(latents.shape[3]), int(latents.shape[4]))
+
+    if isinstance(unpacked_shape, torch.Size):
+        unpacked_shape = tuple(int(x) for x in unpacked_shape)
+
+    if isinstance(unpacked_shape, tuple) and len(unpacked_shape) == 5:
+        if int(unpacked_shape[0]) == int(latents.shape[0]) and int(
+            unpacked_shape[1]
+        ) == int(latents.shape[1]):
+            return (
+                int(unpacked_shape[2]),
+                int(unpacked_shape[3]),
+                int(unpacked_shape[4]),
+            )
+
+    return orig_thw
 
 
 class DenoisingStage(PipelineStage):
@@ -128,6 +173,194 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _is_dit_pipeline(self) -> bool:
+        """Check if the current pipeline is a DiT-based pipeline."""
+        cfg = getattr(self.server_args, "pipeline_config", None)
+        return getattr(cfg, "dit_config", None) is not None
+
+    def _exec_raw_latent_shape(self, batch):
+        """Get the raw latent shape, accounting for bucketed execution shape."""
+        exec_thw = getattr(batch, "exec_latent_shape", None)
+        if exec_thw is None:
+            return batch.raw_latent_shape
+        # raw_latent_shape is [B,C,T,H,W]
+        b, c = batch.raw_latent_shape[0], batch.raw_latent_shape[1]
+        t, h, w = exec_thw
+        return (b, c, t, h, w)
+
+    def _exec_thw(self, batch):
+        """Get the (T,H,W) shape, accounting for bucketed execution shape."""
+        exec_thw = getattr(batch, "exec_latent_shape", None)
+        if exec_thw is None:
+            return tuple(batch.raw_latent_shape[2:5])
+        return exec_thw
+
+    def _get_patch_size_thw(self) -> tuple[int, int, int]:
+        """Normalize patch_size → (pt, ph, pw) robust for int / (h,w) / (t,h,w)."""
+        dit_cfg = self.server_args.pipeline_config.dit_config
+        ps = dit_cfg.patch_size
+        if isinstance(ps, int):
+            pt = getattr(dit_cfg, "patch_size_t", 1)
+            if pt is None:
+                pt = 1
+            return (int(pt), int(ps), int(ps))
+        if len(ps) == 2:
+            return (1, int(ps[0]), int(ps[1]))
+        return (int(ps[0]), int(ps[1]), int(ps[2]))
+
+    def _maybe_attach_bucket_mask(self, batch: Req, attn_metadata: Any):
+        """
+        Checks if a bucket mask should be attached to the attention metadata and does so.
+        This isolates the logic that runs inside the denoising loop.
+        """
+        bm = getattr(batch, "bucket_meta", None)
+
+        # Condition 1: Bucketing must be enabled and have padding.
+        if not (
+            bm
+            and getattr(bm, "enabled", False)
+            and getattr(bm, "padding_ratio", 0.0) > 0.0
+        ):
+            return attn_metadata
+
+        # Condition 2: The system must be configured to use masked bucketing (SDPA, SP=1, etc.)
+        if not self._should_use_bucketing_with_masks():
+            return attn_metadata
+
+        # Condition 3: The mask must have been pre-computed and attached to the bucket_meta.
+        base_mask = getattr(bm, "attention_mask", None)
+        if base_mask is None:
+            return attn_metadata
+
+        mask = base_mask
+
+        pipeline_cfg = getattr(
+            getattr(self, "server_args", None), "pipeline_config", None
+        )
+        if _is_qwen_image_pipeline(pipeline_cfg):
+            is_neg = bool(getattr(batch, "is_cfg_negative", False))
+            prompt_embeds = (
+                getattr(batch, "negative_prompt_embeds", None)
+                if is_neg
+                else getattr(batch, "prompt_embeds", None)
+            )
+            prompt_embeds_mask = (
+                getattr(batch, "negative_prompt_embeds_mask", None)
+                if is_neg
+                else getattr(batch, "prompt_embeds_mask", None)
+            )
+
+            txt_valid = None
+
+            if (
+                isinstance(prompt_embeds_mask, list)
+                and len(prompt_embeds_mask) > 0
+                and isinstance(prompt_embeds_mask[0], torch.Tensor)
+                and prompt_embeds_mask[0].ndim == 2
+            ):
+                txt_valid = prompt_embeds_mask[0]
+            elif (
+                isinstance(prompt_embeds_mask, torch.Tensor)
+                and prompt_embeds_mask.ndim == 2
+            ):
+                txt_valid = prompt_embeds_mask
+            elif (
+                isinstance(prompt_embeds, list)
+                and len(prompt_embeds) > 0
+                and isinstance(prompt_embeds[0], torch.Tensor)
+                and prompt_embeds[0].ndim >= 2
+            ):
+                txt_len = int(prompt_embeds[0].shape[1])
+                if txt_len > 0:
+                    txt_valid = torch.ones(
+                        (mask.shape[0], txt_len), dtype=torch.bool, device=mask.device
+                    )
+            elif isinstance(prompt_embeds, torch.Tensor) and prompt_embeds.ndim >= 2:
+                txt_len = int(prompt_embeds.shape[1])
+                if txt_len > 0:
+                    txt_valid = torch.ones(
+                        (mask.shape[0], txt_len), dtype=torch.bool, device=mask.device
+                    )
+
+            if txt_valid is not None:
+                # Canonical convention: True means a valid (non-padding) token.
+                # Casting numeric masks to bool follows PyTorch semantics (nonzero -> True).
+                if txt_valid.dtype != torch.bool:
+                    txt_valid = txt_valid.to(dtype=torch.bool)
+                if txt_valid.device != mask.device:
+                    txt_valid = txt_valid.to(device=mask.device)
+
+                if __debug__:
+                    if txt_valid.ndim != 2:
+                        raise ValueError(
+                            f"Expected text mask [B,T], got {tuple(txt_valid.shape)}"
+                        )
+                    if txt_valid.shape[0] != mask.shape[0]:
+                        raise ValueError(
+                            f"Text mask batch {txt_valid.shape[0]} != image mask batch {mask.shape[0]}"
+                        )
+
+                mask = torch.cat([txt_valid, mask], dim=1)
+
+        # At this point, we are attaching the mask.
+        # For SDPA backend, attn_metadata may be None. If so, we lazily get or create
+        # a storage object on the batch to reuse across steps in the loop.
+        if attn_metadata is None:
+            storage = getattr(batch, "sdpa_attn_metadata_storage", None)
+            if storage is None:
+                storage = SimpleNamespace()
+                # Store it back on the batch for reuse in subsequent steps of this request.
+                batch.sdpa_attn_metadata_storage = storage
+            attn_metadata = storage
+
+        self._try_attach_attention_mask(attn_metadata, mask, batch)
+
+        # The __debug__ block provides developer-time validation.
+        if __debug__:
+            expected_image_tokens = getattr(bm, "num_tokens", -1)
+            if expected_image_tokens != -1:
+                assert base_mask.shape[1] == expected_image_tokens, (
+                    f"Image mask length {base_mask.shape[1]} != expected tokens {expected_image_tokens}. "
+                    "This indicates a mismatch between mask creation and storage."
+                )
+
+        return attn_metadata
+
+    def _try_attach_attention_mask(self, attn_metadata, attention_mask, batch) -> None:
+        """Wire the mask into SDPA via existing attn_metadata.
+
+        NOTE: Our stored mask uses True=VALID tokens (key padding mask style).
+        """
+        if attention_mask is None:
+            return
+        if attn_metadata is None:
+            raise RuntimeError("SDPA mask requested but attn_metadata is None")
+
+        # Comprehensive validation for faster debugging
+        if __debug__:
+            if attention_mask.dtype != torch.bool:
+                raise ValueError(
+                    f"Attention mask dtype {attention_mask.dtype} != torch.bool"
+                )
+            if attention_mask.ndim != 2:
+                raise ValueError(f"Attention mask ndim {attention_mask.ndim} != 2")
+            # Device validation - compare against batch device context
+            expected_device = batch.latents.device
+            if attention_mask.device != expected_device:
+                raise ValueError(
+                    f"Attention mask device {attention_mask.device} != expected {expected_device}"
+                )
+
+        try:
+            # Use a single, canonical field for SDPA compatibility.
+            # The SDPA backend expects a `key_padding_mask` where True means a token is VALID.
+            setattr(attn_metadata, "key_padding_mask", attention_mask)
+
+            # Re-enable for backward compatibility until full audit is done.
+            setattr(attn_metadata, "attention_mask", attention_mask)
+        except (AttributeError, TypeError) as e:
+            raise RuntimeError("Cannot attach key_padding_mask to attn_metadata") from e
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -494,6 +727,216 @@ class DenoisingStage(PipelineStage):
 
         return reserved_frames_mask_sp, z_sp
 
+    def _should_use_bucketing_with_masks(self) -> bool:
+        """Thin wrapper to call the centralized whitelist logic."""
+        return should_use_masked_bucketing(
+            attn_backend=self.attn_backend.get_enum(),
+            sp_world_size=get_sp_world_size(),
+            is_dit=self._is_dit_pipeline(),
+        )
+
+    def _prepare_bucketing_for_step(self, latents, batch, server_args):
+        """
+        Applies shape bucketing and prepares the attention mask if needed.
+        This now delegates the core logic to centralized, testable utility functions.
+        """
+        # v1: VMOBA not supported with bucketing
+        if self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
+            batch.bucket_meta = None
+            batch.exec_latent_shape = None
+
+            reqs = getattr(batch, "reqs", None)
+            if isinstance(reqs, (list, tuple)):
+                for req in reqs:
+                    req.bucket_id = -1
+                    req.padding_ratio = 0.0
+                    req.bucket_applied = False
+                    req.bucket_padded = False
+                    req.bucket_exact_match = False
+                    req.bucket_hit = False
+            else:
+                batch.bucket_id = -1
+                batch.padding_ratio = 0.0
+                batch.bucket_applied = False
+                batch.bucket_padded = False
+                batch.bucket_exact_match = False
+                batch.bucket_hit = False
+
+            return latents
+
+        # v1: DiT-only, HW-only
+        if server_args.enable_diffusion_hw_bucketing and self._is_dit_pipeline():
+            if not isinstance(latents, torch.Tensor) or latents.ndim != 5:
+                batch.bucket_meta = None
+                batch.exec_latent_shape = None
+
+                reqs = getattr(batch, "reqs", None)
+                if isinstance(reqs, (list, tuple)):
+                    for req in reqs:
+                        req.bucket_id = -1
+                        req.padding_ratio = 0.0
+                        req.bucket_applied = False
+                        req.bucket_padded = False
+                        req.bucket_exact_match = False
+                        req.bucket_hit = False
+                else:
+                    batch.bucket_id = -1
+                    batch.padding_ratio = 0.0
+                    batch.bucket_applied = False
+                    batch.bucket_padded = False
+                    batch.bucket_exact_match = False
+                    batch.bucket_hit = False
+
+                return latents
+
+            orig_thw = _infer_orig_thw_from_latents(
+                latents,
+                getattr(batch, "unpacked_latent_shape", None),
+            )
+
+            latents, bucket_meta = apply_shape_bucketing(
+                latents,
+                server_args,
+                orig_thw=orig_thw,
+            )
+
+            batch.bucket_meta = bucket_meta
+            if bucket_meta is None or not bucket_meta.enabled:
+                batch.exec_latent_shape = None
+            else:
+                batch.exec_latent_shape = (
+                    int(bucket_meta.orig_t),
+                    int(bucket_meta.bucket_h),
+                    int(bucket_meta.bucket_w),
+                )
+
+            bucketing_bench_logs = get_bool_env_var(
+                "SGLANG_DIFFUSION_BUCKETING_BENCH_LOGS", "false"
+            )
+            bucketing_log = logger.info if bucketing_bench_logs else logger.debug
+
+            orig_thw = get_orig_thw(bucket_meta)
+
+            if bucket_meta.enabled and bucket_meta.padding_ratio > 0.0:
+                if self._should_use_bucketing_with_masks():
+                    assert (
+                        get_sp_world_size() == 1
+                    ), "Masked bucketing is not supported with sequence parallelism."
+
+                    mask, num_tokens = build_key_padding_mask_bcthw(
+                        B=latents.shape[0],
+                        exec_thw=batch.exec_latent_shape,
+                        orig_thw=orig_thw,
+                        patch_thw=self._get_patch_size_thw(),
+                        device=latents.device,
+                    )
+
+                    bucket_meta.attention_mask = mask
+                    bucket_meta.num_tokens = num_tokens
+
+                    bucketing_log(
+                        "Bucketing: bucket_id=%s status=%s orig=%s exec=%s padding_ratio=%.4f masked=%s attn_backend=%s",
+                        bucket_meta.bucket_id,
+                        "kept",
+                        orig_thw,
+                        batch.exec_latent_shape,
+                        bucket_meta.padding_ratio,
+                        True,
+                        self.attn_backend.get_enum().name,
+                    )
+                else:
+                    bucketing_log(
+                        "Bucketing: bucket_id=%s status=%s orig=%s exec=%s padding_ratio=%.4f masked=%s attn_backend=%s",
+                        bucket_meta.bucket_id,
+                        "reverted",
+                        orig_thw,
+                        orig_thw,
+                        bucket_meta.padding_ratio,
+                        False,
+                        self.attn_backend.get_enum().name,
+                    )
+                    latents = remove_shape_bucketing(latents, bucket_meta)
+                    batch.bucket_meta = None
+                    batch.exec_latent_shape = None
+            else:
+                if bucket_meta.enabled:
+                    bucketing_log(
+                        "Bucketing: bucket_id=%s status=%s orig=%s exec=%s padding_ratio=%.4f masked=%s attn_backend=%s",
+                        bucket_meta.bucket_id,
+                        "kept",
+                        orig_thw,
+                        batch.exec_latent_shape,
+                        bucket_meta.padding_ratio,
+                        False,
+                        self.attn_backend.get_enum().name,
+                    )
+
+            if batch.bucket_meta is not None and batch.bucket_meta.enabled:
+                bucket_id = int(batch.bucket_meta.bucket_id)
+                padding_ratio = float(batch.bucket_meta.padding_ratio)
+
+                bucket_applied = True
+                bucket_padded = padding_ratio > 0.0
+                bucket_exact_match = padding_ratio == 0.0
+
+                reqs = getattr(batch, "reqs", None)
+                if isinstance(reqs, (list, tuple)):
+                    for req in reqs:
+                        req.bucket_id = bucket_id
+                        req.padding_ratio = padding_ratio
+
+                        req.bucket_applied = bucket_applied
+                        req.bucket_padded = bucket_padded
+                        req.bucket_exact_match = bucket_exact_match
+
+                        req.bucket_hit = bucket_padded
+                else:
+                    batch.bucket_id = bucket_id
+                    batch.padding_ratio = padding_ratio
+
+                    batch.bucket_applied = bucket_applied
+                    batch.bucket_padded = bucket_padded
+                    batch.bucket_exact_match = bucket_exact_match
+
+                    batch.bucket_hit = bucket_padded
+            else:
+                reqs = getattr(batch, "reqs", None)
+                if isinstance(reqs, (list, tuple)):
+                    for req in reqs:
+                        req.bucket_id = -1
+                        req.padding_ratio = 0.0
+                        req.bucket_applied = False
+                        req.bucket_padded = False
+                        req.bucket_exact_match = False
+                        req.bucket_hit = False
+                else:
+                    batch.bucket_id = -1
+                    batch.padding_ratio = 0.0
+                    batch.bucket_applied = False
+                    batch.bucket_padded = False
+                    batch.bucket_exact_match = False
+                    batch.bucket_hit = False
+        else:
+            batch.bucket_meta = None
+            batch.exec_latent_shape = None
+            reqs = getattr(batch, "reqs", None)
+            if isinstance(reqs, (list, tuple)):
+                for req in reqs:
+                    req.bucket_id = -1
+                    req.padding_ratio = 0.0
+                    req.bucket_applied = False
+                    req.bucket_padded = False
+                    req.bucket_exact_match = False
+                    req.bucket_hit = False
+            else:
+                batch.bucket_id = -1
+                batch.padding_ratio = 0.0
+                batch.bucket_applied = False
+                batch.bucket_padded = False
+                batch.bucket_exact_match = False
+                batch.bucket_hit = False
+        return latents
+
     def _handle_boundary_ratio(
         self,
         server_args,
@@ -623,6 +1066,8 @@ class DenoisingStage(PipelineStage):
                 reserved_frames_masks[0] if reserved_frames_masks is not None else None
             ), z
 
+        latents = self._prepare_bucketing_for_step(latents, batch, server_args)
+
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
             latents.shape[0],
@@ -743,6 +1188,21 @@ class DenoisingStage(PipelineStage):
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
             batch.trajectory_latents = trajectory_tensor.cpu()
+
+        bm = getattr(batch, "bucket_meta", None)
+        if bm is not None and getattr(bm, "enabled", False):
+            logger.debug(
+                "DenoisingStage: unpadding latents and clearing bucketing metadata (primary cleanup point)."
+            )
+            latents = remove_shape_bucketing(latents, bm)
+            if hasattr(bm, "attention_mask"):
+                bm.attention_mask = None
+            batch.bucket_meta = None
+            batch.exec_latent_shape = None
+
+        # Cleanup: Remove the sdpa_attn_metadata_storage to prevent leakage if Req objects are reused.
+        if hasattr(batch, "sdpa_attn_metadata_storage"):
+            del batch.sdpa_attn_metadata_storage
 
         # Update batch with final latents
         batch.latents = self.server_args.pipeline_config.post_denoising_loop(
@@ -976,6 +1436,7 @@ class DenoisingStage(PipelineStage):
         """
         Run the denoising loop.
         """
+
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
@@ -1055,7 +1516,6 @@ class DenoisingStage(PipelineStage):
                             latent_model_input, t_device
                         )
 
-                        # Predict noise residual
                         attn_metadata = self._build_attn_metadata(
                             i,
                             batch,
@@ -1063,6 +1523,7 @@ class DenoisingStage(PipelineStage):
                             timestep_value=t_int,
                             timesteps=timesteps_cpu,
                         )
+
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
@@ -1224,8 +1685,10 @@ class DenoisingStage(PipelineStage):
         ):
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
-                raw_latent_shape=batch.raw_latent_shape[2:5],
-                patch_size=server_args.pipeline_config.dit_config.patch_size,
+                raw_latent_shape=self._exec_thw(
+                    batch
+                ),  # Use exec shape for consistency
+                patch_size=self._get_patch_size_thw(),
                 STA_param=batch.STA_param,
                 VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
                 device=get_local_torch_device(),
@@ -1269,15 +1732,7 @@ class DenoisingStage(PipelineStage):
                 cache = Svg2Cache()
                 batch.extra["svg2_cache"] = cache
 
-            patch_size = server_args.pipeline_config.dit_config.patch_size
-            if isinstance(patch_size, list):
-                patch_size = tuple(patch_size)
-            if isinstance(patch_size, int):
-                patch_size_t = getattr(
-                    server_args.pipeline_config.dit_config, "patch_size_t", None
-                )
-                if patch_size_t is not None:
-                    patch_size = (patch_size_t, patch_size, patch_size)
+            patch_size = self._get_patch_size_thw()
 
             context_length = 0
             prompt_length = None
@@ -1300,7 +1755,7 @@ class DenoisingStage(PipelineStage):
 
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=current_timestep,
-                raw_latent_shape=batch.raw_latent_shape,
+                raw_latent_shape=self._exec_raw_latent_shape(batch),
                 patch_size=patch_size,
                 num_q_centroids=svg2_cfg.get("svg2_num_q_centroids", 300),
                 num_k_centroids=svg2_cfg.get("svg2_num_k_centroids", 1000),
@@ -1317,18 +1772,36 @@ class DenoisingStage(PipelineStage):
                 calculate_density=False,  # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
-            moba_params = server_args.attention_backend_config.moba_config.copy()
+            cfg = getattr(server_args, "attention_backend_config", None)
+            moba_cfg = getattr(cfg, "moba_config", None)
+            if moba_cfg is None and isinstance(cfg, dict):
+                moba_cfg = cfg.get("moba_config", None)
+            if moba_cfg is None:
+                moba_cfg = cfg
+
+            moba_params = dict(moba_cfg) if moba_cfg is not None else {}
+
+            raw_shape = getattr(batch, "raw_latent_shape", None)
+            if isinstance(raw_shape, torch.Size):
+                raw_shape = tuple(int(x) for x in raw_shape)
+
+            if isinstance(raw_shape, tuple) and len(raw_shape) == 5:
+                raw_latent_shape = tuple(int(x) for x in raw_shape[2:5])
+            else:
+                raw_latent_shape = self._exec_thw(batch)
+
             moba_params.update(
                 {
                     "current_timestep": i,
-                    "raw_latent_shape": batch.raw_latent_shape[2:5],
-                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
+                    "raw_latent_shape": raw_latent_shape,
+                    "patch_size": self._get_patch_size_thw(),
                     "device": get_local_torch_device(),
                 }
             )
+            attn_metadata = self.attn_metadata_builder.build(**moba_params)
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
-                raw_latent_shape=batch.raw_latent_shape
+                raw_latent_shape=self._exec_raw_latent_shape(batch)
             )
         else:
             # attn_metadata can be None for SDPA attention backend
@@ -1394,6 +1867,7 @@ class DenoisingStage(PipelineStage):
         # positive pass
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False
+            attn_metadata = self._maybe_attach_bucket_mask(batch, attn_metadata)
             with set_forward_context(
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
@@ -1419,6 +1893,7 @@ class DenoisingStage(PipelineStage):
         # negative pass
         if not server_args.enable_cfg_parallel or cfg_rank != 0:
             batch.is_cfg_negative = True
+            attn_metadata = self._maybe_attach_bucket_mask(batch, attn_metadata)
             with set_forward_context(
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,

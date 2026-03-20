@@ -90,11 +90,13 @@ class LatentPreparationStage(PipelineStage):
             if latent_ids is not None:
                 batch.latent_ids = latent_ids.to(device=device)
 
+            batch.unpacked_latent_shape = latents.shape
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
         else:
             latents = latents.to(device)
+            batch.unpacked_latent_shape = latents.shape
 
         # Scale the initial noise if needed
         if hasattr(self.scheduler, "init_noise_sigma"):

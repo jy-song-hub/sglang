@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.utils.shape_bucketing import (
+    remove_shape_bucketing,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -202,6 +205,18 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
+        bm = getattr(batch, "bucket_meta", None)
+        if bm is not None and getattr(bm, "enabled", False):
+            logger.debug(
+                "DecodingStage: bucket_meta still enabled at decode-time; denoising is the primary cleanup point. "
+                "Running defensive unpadding before VAE decode."
+            )
+            batch.latents = remove_shape_bucketing(batch.latents, bm)
+            if hasattr(bm, "attention_mask"):
+                bm.attention_mask = None
+            batch.bucket_meta = None
+            if getattr(batch, "exec_latent_shape", None) is not None:
+                batch.exec_latent_shape = None
         frames = self.decode(batch.latents, server_args)
 
         # decode trajectory latents if needed

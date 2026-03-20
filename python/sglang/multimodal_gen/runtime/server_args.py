@@ -96,6 +96,11 @@ class ServerArgs:
         None  # cache-dit config for diffusers
     )
 
+    # Diffusion HW Bucketing (v1: DiT-only, latent H/W-only)
+    enable_diffusion_hw_bucketing: bool = False
+    diffusion_hw_buckets: str | None = None
+    diffusion_hw_bucketing_max_waste: float = 0.20
+
     # Distributed executor backend
     nccl_port: Optional[int] = None
 
@@ -775,6 +780,32 @@ class ServerArgs:
             type=str,
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+
+        # Diffusion HW Bucketing (v1)
+        parser.add_argument(
+            "--enable-diffusion-hw-bucketing",
+            action=StoreBoolean,
+            default=False,
+            help="Enable diffusion HW bucketing (HW-only, DiT-only in v1).",
+        )
+        parser.add_argument(
+            "--diffusion-hw-buckets",
+            type=str,
+            default=None,
+            help=(
+                "Comma-separated bucket list in *latent* HxW (not decoded pixel size), "
+                'e.g. "64x64,96x96,128x128". These buckets apply to the latent tensor '
+                "(post-VAE, input to the DiT/UNet). For a typical VAE scale factor of 8, "
+                'those correspond to ~"512x512,768x768,1024x1024" output images. '
+                "If unset, use built-in defaults (64x64,96x96,128x128)."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-hw-bucketing-max-waste",
+            type=float,
+            default=0.20,
+            help="Skip bucketing if padding waste exceeds this threshold. Max allowed spatial padding waste for HW bucketing.",
         )
 
         # LoRA

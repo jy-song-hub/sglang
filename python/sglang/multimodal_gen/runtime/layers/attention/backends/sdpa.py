@@ -2,12 +2,14 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any, Optional
+
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
-    AttentionMetadata,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -57,22 +59,50 @@ class SDPAImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        attn_metadata: Optional[Any] = None,
     ) -> torch.Tensor:
         # transpose to bs, heads, seq_len, head_dim
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        query = query.transpose(1, 2)  # [B, Hq, L, Dh]
+        key = key.transpose(1, 2)  # [B, Hk, S, Dh]
+        value = value.transpose(1, 2)  # [B, Hv, S, Dv]
+
+        attn_mask = None
+        valid_mask = None
+
+        # Support both attn_metadata=None and field fallbacks
+        if attn_metadata is not None:
+            valid_mask = getattr(attn_metadata, "attention_mask", None)
+            if valid_mask is None:
+                valid_mask = getattr(attn_metadata, "key_padding_mask", None)
+
+        if valid_mask is not None:
+            if __debug__:
+                if valid_mask.dtype != torch.bool:
+                    raise ValueError(f"Expected bool mask, got {valid_mask.dtype}")
+                if valid_mask.ndim != 2:
+                    raise ValueError(f"Expected [B,S], got {tuple(valid_mask.shape)}")
+                if valid_mask.shape[0] != query.shape[0]:
+                    raise ValueError("Mask B != query B")
+                if valid_mask.shape[1] != key.shape[-2]:
+                    raise ValueError("Mask S != key S")
+                if valid_mask.device != query.device:
+                    raise ValueError(
+                        f"Mask device {valid_mask.device} != query device {query.device}"
+                    )
+
+            # PyTorch SDPA boolean attn_mask uses True=participate, False=masked.
+            # Broadcast to [B, 1, 1, S] to apply key-padding mask across heads and query length.
+            attn_mask = valid_mask[:, None, None, :]
+
         attn_kwargs = {
-            "attn_mask": None,
+            "attn_mask": attn_mask,
             "dropout_p": self.dropout,
             "is_causal": self.causal,
             "scale": self.softmax_scale,
         }
         if query.shape[1] != key.shape[1]:
             attn_kwargs["enable_gqa"] = True
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
-        )
+
+        output = F.scaled_dot_product_attention(query, key, value, **attn_kwargs)
         output = output.transpose(1, 2)
         return output

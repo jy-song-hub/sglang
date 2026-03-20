@@ -586,7 +586,7 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
 
         latents = maybe_unpad_latents(latents, batch)
-        latents = latents.view(
+        latents = latents.reshape(
             batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
         )
         latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
@@ -611,6 +611,6 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         ) = self._unpad_and_unpack_latents(latents, batch)
         b, c, f, h, w = latents.shape
         latents = latents[:, :, 1:]  # remove the first frame as it is the origin input
-        latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
+        latents = latents.permute(0, 2, 1, 3, 4).reshape(-1, c, 1, h, w)
         # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
